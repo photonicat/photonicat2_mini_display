@@ -572,6 +572,13 @@ func deepMergeJSON(dst, src map[string]interface{}) map[string]interface{} {
 			}
 		}
 
+		// Preserve existing ping site if new value is empty string
+		if key == "ping_site0" || key == "ping_site1" {
+			if s, ok := srcVal.(string); ok && strings.TrimSpace(s) == "" {
+				continue
+			}
+		}
+
 		if dstVal, exists := dst[key]; exists {
 			// Key exists in both - need to merge
 			srcMap, srcIsMap := srcVal.(map[string]interface{})
