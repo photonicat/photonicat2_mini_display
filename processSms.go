@@ -121,6 +121,7 @@ func collectAndDrawSms(cfg *Config) int {
 	numPages := len(smsPagesImages)
 	lastNumPages = numPages
 
+	bumpDataEpoch() // SMS page images changed -> let the render loop refresh
 	return numPages
 }
 

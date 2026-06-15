@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -101,6 +102,11 @@ var (
 	autoRotatePages    = false
 	customMetricsMgr   *CustomMetricManager
 
+	// dataEpoch increments whenever a data-collection pass stores fresh display
+	// values. The render loop compares it against the last rendered epoch to skip
+	// re-rendering/re-blitting the middle frame when nothing changed (big CPU win).
+	dataEpoch int64
+
 	// Frame buffer pool is now managed by BufferManager
 
 	lastActivity   = time.Now()
@@ -119,20 +125,26 @@ var (
 	battChargingStatus = false
 	battSOC            = 0
 
-	// Base intervals
-	baseBatteryDataInterval   = 1 * time.Second
-	baseDataGatherInterval    = 2 * time.Second
-	baseNetworkGatherInterval = 3 * time.Second
+	// Base intervals (active state). Halved from the original cadence to cut
+	// CPU and host load — data on this display rarely changes faster than this.
+	baseBatteryDataInterval   = 2 * time.Second
+	baseDataGatherInterval    = 4 * time.Second
+	baseNetworkGatherInterval = 6 * time.Second
 	basePcatWebInterval       = INTERVAL_PCAT_WEB_COLLECT
 	baseSmsInterval           = INTERVAL_SMS_COLLECT
+	// ICMP ping has its own (slower) cadence and a much larger idle slowdown:
+	// it is the only real outbound network traffic, so we minimise it.
+	basePingInterval = 6 * time.Second
 
 	// Current intervals (can be modified by idle state)
-	batteryDataInterval   = 1 * time.Second
-	dataGatherInterval    = 2 * time.Second
-	networkGatherInterval = 3 * time.Second
+	batteryDataInterval   = baseBatteryDataInterval
+	dataGatherInterval    = baseDataGatherInterval
+	networkGatherInterval = baseNetworkGatherInterval
+	pingInterval          = basePingInterval
 
 	// Idle state management
 	idleMultiplier     = 10
+	pingIdleMultiplier = 16 // ICMP ping slows to 1/16 when idle (96s)
 	intervalUpdateChan = make(chan struct{}, 10)
 
 	baseFPS    = DEFAULT_FPS
@@ -432,6 +444,13 @@ func (dw *DisplayWrapper) GetTransferStats() map[string]interface{} {
 	}
 }
 
+// bumpDataEpoch marks that fresh display data has been stored. Called at the end
+// of each data-collection pass; the render loop reads it to decide whether the
+// middle frame needs re-rendering. Cheap atomic, safe from any goroutine.
+func bumpDataEpoch() {
+	atomic.AddInt64(&dataEpoch, 1)
+}
+
 // updateIntervals updates all intervals and FPS based on current idle state
 func updateIntervals() {
 	if idleState == STATE_IDLE {
@@ -439,6 +458,9 @@ func updateIntervals() {
 		batteryDataInterval = baseBatteryDataInterval * time.Duration(idleMultiplier)
 		dataGatherInterval = baseDataGatherInterval * time.Duration(idleMultiplier)
 		networkGatherInterval = baseNetworkGatherInterval * time.Duration(idleMultiplier)
+		// ICMP ping slows much more aggressively (1/16) — it is the only real
+		// outbound traffic and the screen is dimmed, so freshness doesn't matter.
+		pingInterval = basePingInterval * time.Duration(pingIdleMultiplier)
 		// Set FPS to very low value during idle (effectively 0.1 FPS by using 1 and adjusting sleep calculation)
 		desiredFPS = 1  // Will be adjusted in the sleep calculation for idle state
 	} else {
@@ -446,6 +468,7 @@ func updateIntervals() {
 		batteryDataInterval = baseBatteryDataInterval
 		dataGatherInterval = baseDataGatherInterval
 		networkGatherInterval = baseNetworkGatherInterval
+		pingInterval = basePingInterval
 		desiredFPS = baseFPS
 	}
 
@@ -634,6 +657,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				collectLinuxData(cfg)
+				bumpDataEpoch()
 			case <-intervalUpdateChan:
 				ticker.Stop()
 				ticker = time.NewTicker(dataGatherInterval)
@@ -649,6 +673,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				collectNetworkData(cfg)
+				bumpDataEpoch()
 			case <-intervalUpdateChan:
 				ticker.Stop()
 				ticker = time.NewTicker(dataGatherInterval)
@@ -664,9 +689,28 @@ func main() {
 			select {
 			case <-ticker.C:
 				collectBatteryData()
+				bumpDataEpoch()
 			case <-intervalUpdateChan:
 				ticker.Stop()
 				ticker = time.NewTicker(batteryDataInterval)
+			}
+		}
+	}()
+
+	// ICMP ping runs on its own ticker so its much slower idle cadence
+	// (pingIdleMultiplier) is independent of the rest of network collection.
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				collectPingData(cfg)
+				bumpDataEpoch()
+			case <-intervalUpdateChan:
+				ticker.Stop()
+				ticker = time.NewTicker(pingInterval)
 			}
 		}
 	}()
@@ -679,6 +723,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				getInfoFromPcatWeb()
+				bumpDataEpoch()
 			case <-intervalUpdateChan:
 				currentInterval := basePcatWebInterval
 				if idleState == STATE_IDLE {
@@ -698,6 +743,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				collectWANNetworkSpeed()
+				bumpDataEpoch()
 			case <-intervalUpdateChan:
 				ticker.Stop()
 				ticker = time.NewTicker(networkGatherInterval)
@@ -820,6 +866,16 @@ func mainLoop() {
 	isSMS := false
 	nextPageIdx := 0
 	isNextPageSMS := false
+
+	// Change-detection state for the normal-render path: only re-render the
+	// middle frame when the data epoch advanced, the page changed, or a periodic
+	// safety refresh is due (covers any writer that doesn't bump the epoch).
+	lastRenderedEpoch := int64(-1)
+	lastRenderedPage := -1
+	lastRenderedSMS := false
+	lastForcedRender := time.Now()
+	const forceRenderInterval = 2 * time.Second
+
 	faceTiny, _, err := getFontFace("tiny")
 
 	// Track frame-by-frame performance during transition
@@ -1112,22 +1168,46 @@ func mainLoop() {
 					drawFooter(display, footerFramebuffers[middleFrames%2], localIdx, cfgNumPages, isSMS)
 				}
 
-				//draw middle
-				clearFrame(middleFramebuffers[middleFrames%2], middleFrameWidth, middleFrameHeight)
-				renderMiddle(middleFramebuffers[middleFrames%2], &cfg, isSMS, localIdx)
+				// Only re-render the middle frame when something actually changed.
+				// Data updates bump dataEpoch; page flips change page/SMS; the
+				// periodic force refresh is a safety net for un-instrumented
+				// writers (e.g. custom metrics). The FPS overlay needs continuous
+				// redraws, so force rendering while it's on.
+				curEpoch := atomic.LoadInt64(&dataEpoch)
+				needRender := showFPS ||
+					curEpoch != lastRenderedEpoch ||
+					localIdx != lastRenderedPage ||
+					isSMS != lastRenderedSMS ||
+					time.Since(lastForcedRender) >= forceRenderInterval
 
-				//draw fps - use cached text for better performance
-				if showFPS {
-					// Update cached FPS text periodically
-					if time.Since(lastFPSUpdate) > 100*time.Millisecond {
-						lastFPSUpdate = time.Now()
-						cachedFPSText = "FPS:" + strconv.Itoa(int(fps)) + ", " + strconv.Itoa(middleFrames)
+				if needRender {
+					buf := middleFramebuffers[middleFrames%2]
+
+					//draw middle
+					clearFrame(buf, middleFrameWidth, middleFrameHeight)
+					renderMiddle(buf, &cfg, isSMS, localIdx)
+
+					//draw fps - use cached text for better performance
+					if showFPS {
+						// Update cached FPS text periodically
+						if time.Since(lastFPSUpdate) > 100*time.Millisecond {
+							lastFPSUpdate = time.Now()
+							cachedFPSText = "FPS:" + strconv.Itoa(int(fps)) + ", " + strconv.Itoa(middleFrames)
+						}
+						if cachedFPSText != "" {
+							drawText(buf, cachedFPSText, 10, 240, faceTiny, PCAT_RED, false)
+						}
 					}
-					if cachedFPSText != "" {
-						drawText(middleFramebuffers[middleFrames%2], cachedFPSText, 10, 240, faceTiny, PCAT_RED, false)
-					}
+
+					// sendMiddleOptimized skips the (expensive) SPI blit when the
+					// rendered pixels are byte-identical to what's already on screen.
+					sendMiddleOptimized(display, buf)
+
+					lastRenderedEpoch = curEpoch
+					lastRenderedPage = localIdx
+					lastRenderedSMS = isSMS
+					lastForcedRender = time.Now()
 				}
-				sendMiddle(display, middleFramebuffers[middleFrames%2])
 				middleFrames++
 
 				// stable‐FPS sleep with signal-based interruption for page changes

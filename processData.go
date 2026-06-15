@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -676,67 +677,8 @@ func collectNetworkData(cfg Config) {
 		globalData.Store("WifiClients", wifiClients)
 	}
 
-	// Ping Site0 using ICMP with statistics tracking
-	ping0Stats.mu.Lock()
-	ping0Stats.total++
-	if ping0, err := pingICMP(cfg.PingSite0); err != nil {
-		// Keep showing last successful ping value, or -1 if never succeeded
-		if ping0Stats.lastSuccess > 0 {
-			globalData.Store("Ping0", ping0Stats.lastSuccess)
-		} else {
-			globalData.Store("Ping0", int64(-1))
-		}
-	} else if ping0 == -2 {
-		// Timeout case - show red X
-		globalData.Store("Ping0", int64(-2))
-	} else if ping0 > 0 {
-		// Successful ping - update last success and display it
-		ping0Stats.successful++
-		ping0Stats.lastSuccess = ping0
-		globalData.Store("Ping0", ping0)
-	} else {
-		// Other error case
-		if ping0Stats.lastSuccess > 0 {
-			globalData.Store("Ping0", ping0Stats.lastSuccess)
-		} else {
-			globalData.Store("Ping0", int64(-1))
-		}
-	}
-	// Calculate and store success rate
-	successRate0 := float64(ping0Stats.successful) / float64(ping0Stats.total) * 100
-	globalData.Store("Ping0Rate", fmt.Sprintf("%.0f", successRate0))
-	ping0Stats.mu.Unlock()
-
-	// Ping Site1 using ICMP with statistics tracking
-	ping1Stats.mu.Lock()
-	ping1Stats.total++
-	if ping1, err := pingICMP(cfg.PingSite1); err != nil {
-		// Keep showing last successful ping value, or -1 if never succeeded
-		if ping1Stats.lastSuccess > 0 {
-			globalData.Store("Ping1", ping1Stats.lastSuccess)
-		} else {
-			globalData.Store("Ping1", int64(-1))
-		}
-	} else if ping1 == -2 {
-		// Timeout case - show red X
-		globalData.Store("Ping1", int64(-2))
-	} else if ping1 > 0 {
-		// Successful ping - update last success and display it
-		ping1Stats.successful++
-		ping1Stats.lastSuccess = ping1
-		globalData.Store("Ping1", ping1)
-	} else {
-		// Other error case
-		if ping1Stats.lastSuccess > 0 {
-			globalData.Store("Ping1", ping1Stats.lastSuccess)
-		} else {
-			globalData.Store("Ping1", int64(-1))
-		}
-	}
-	// Calculate and store success rate
-	successRate1 := float64(ping1Stats.successful) / float64(ping1Stats.total) * 100
-	globalData.Store("Ping1Rate", fmt.Sprintf("%.0f", successRate1))
-	ping1Stats.mu.Unlock()
+	// ICMP ping now runs in its own goroutine (collectPingData) on a slower,
+	// independently-throttled cadence, so a dead host can't block this function.
 
 	/*
 		// Country based on public IP geolocation.
@@ -754,6 +696,66 @@ func collectNetworkData(cfg Config) {
 	} else {
 		globalData.Store("PublicIPv6", ipv6)
 	}
+}
+
+// recordPingResult updates the running ping statistics for one site and stores
+// the value/success-rate the UI reads. total/successful/lastSuccess are pointers
+// into the per-site stats struct; mu guards them. pingVal/pingErr are the result
+// of a single pingICMP() call (pingVal == -2 means timeout).
+func recordPingResult(mu *sync.RWMutex, total, successful *int, lastSuccess *int64,
+	valKey, rateKey string, pingVal int64, pingErr error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	*total++
+	switch {
+	case pingErr != nil:
+		// Keep showing the last good value, or -1 if we never succeeded.
+		if *lastSuccess > 0 {
+			globalData.Store(valKey, *lastSuccess)
+		} else {
+			globalData.Store(valKey, int64(-1))
+		}
+	case pingVal == -2:
+		globalData.Store(valKey, int64(-2)) // timeout -> red X
+	case pingVal > 0:
+		*successful++
+		*lastSuccess = pingVal
+		globalData.Store(valKey, pingVal)
+	default:
+		if *lastSuccess > 0 {
+			globalData.Store(valKey, *lastSuccess)
+		} else {
+			globalData.Store(valKey, int64(-1))
+		}
+	}
+
+	rate := float64(*successful) / float64(*total) * 100
+	globalData.Store(rateKey, fmt.Sprintf("%.0f", rate))
+}
+
+// collectPingData pings both configured sites concurrently. It runs on its own
+// (slow, idle-throttled) ticker so a dead host blocks only this goroutine for at
+// most pingICMP's timeout, never the rest of network collection.
+func collectPingData(cfg Config) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		ping0, err := pingICMP(cfg.PingSite0)
+		recordPingResult(&ping0Stats.mu, &ping0Stats.total, &ping0Stats.successful,
+			&ping0Stats.lastSuccess, "Ping0", "Ping0Rate", ping0, err)
+	}()
+
+	go func() {
+		defer wg.Done()
+		ping1, err := pingICMP(cfg.PingSite1)
+		recordPingResult(&ping1Stats.mu, &ping1Stats.total, &ping1Stats.successful,
+			&ping1Stats.lastSuccess, "Ping1", "Ping1Rate", ping1, err)
+	}()
+
+	wg.Wait()
 }
 
 func getSN() (string, error) {
@@ -1265,7 +1267,7 @@ func pingICMP(host string) (int64, error) {
 	// Set privileged mode if possible; otherwise, false will use UDP.
 	pinger.SetPrivileged(true)
 	pinger.Count = 1
-	pinger.Timeout = 5 * time.Second // Increased timeout to 5 seconds
+	pinger.Timeout = 2 * time.Second // 2s is plenty; keeps a dead host from stalling long
 
 	// Run the ping (blocking).
 	err = pinger.Run()
