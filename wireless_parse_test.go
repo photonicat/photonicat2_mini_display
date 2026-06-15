@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 func TestParseWirelessShow(t *testing.T) {
 	tests := []struct {
@@ -67,3 +71,36 @@ wireless.default_radio1.ssid='photonicat2-5G'`,
 		})
 	}
 }
+
+func TestStringCache(t *testing.T) {
+	c := newStringCache(time.Hour)
+	calls := 0
+	fetch := func() (string, error) { calls++; return "v1", nil }
+
+	// First call fetches.
+	if v, _ := c.get(fetch); v != "v1" || calls != 1 {
+		t.Fatalf("first get: v=%q calls=%d", v, calls)
+	}
+	// Within TTL: cached, no new fetch.
+	if v, _ := c.get(fetch); v != "v1" || calls != 1 {
+		t.Fatalf("cached get: v=%q calls=%d (should not refetch)", v, calls)
+	}
+
+	// On error after expiry, the last good value is served.
+	c2 := newStringCache(0) // 0 TTL -> always expired
+	if v, _ := c2.get(func() (string, error) { return "good", nil }); v != "good" {
+		t.Fatalf("seed: v=%q", v)
+	}
+	v, err := c2.get(func() (string, error) { return "", errTest })
+	if err != nil || v != "good" {
+		t.Fatalf("error path should serve stale: v=%q err=%v", v, err)
+	}
+
+	// With no prior value, an error propagates.
+	c3 := newStringCache(time.Hour)
+	if _, err := c3.get(func() (string, error) { return "", errTest }); err == nil {
+		t.Fatal("expected error when no cached value exists")
+	}
+}
+
+var errTest = fmt.Errorf("boom")

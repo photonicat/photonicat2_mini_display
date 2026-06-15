@@ -70,6 +70,46 @@ var (
 	openWrtVal  bool
 )
 
+// stringCache memoises the result of an expensive lookup (a shell-out or HTTP
+// round-trip) for a fixed TTL. On refresh failure it keeps serving the last
+// good value, so a transient error doesn't cause a thundering retry every cycle.
+type stringCache struct {
+	mu    sync.Mutex
+	ttl   time.Duration
+	val   string
+	at    time.Time
+	valid bool
+}
+
+func newStringCache(ttl time.Duration) *stringCache {
+	return &stringCache{ttl: ttl}
+}
+
+// get returns the cached value if it is still fresh; otherwise it calls fetch,
+// stores the result, and returns it. If fetch errors but we have a previous
+// value, the stale value is returned with no error.
+func (c *stringCache) get(fetch func() (string, error)) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.valid && time.Since(c.at) < c.ttl {
+		return c.val, nil
+	}
+
+	v, err := fetch()
+	if err != nil {
+		if c.valid {
+			return c.val, nil // serve last good value
+		}
+		return "", err
+	}
+
+	c.val = v
+	c.at = time.Now()
+	c.valid = true
+	return v, nil
+}
+
 func getUserAgent() string {
 	return "photonicat2_display/r7700"
 }
@@ -1547,7 +1587,18 @@ func getWanIPv4() (string, error) {
 }
 
 // getPublicIPv4 makes an HTTP request to a public API to fetch the external IPv4 address.
+// Public IP changes very rarely, but the network cycle asked for it every few
+// seconds — an HTTP round-trip to an external host each time. Cache for an hour.
+var (
+	publicIPv4Cache = newStringCache(60 * time.Minute)
+	publicIPv6Cache = newStringCache(60 * time.Minute)
+)
+
 func getPublicIPv4() (string, error) {
+	return publicIPv4Cache.get(fetchPublicIPv4)
+}
+
+func fetchPublicIPv4() (string, error) {
 	resp, err := secureHTTPClient.Get("https://4.photonicat.com/ip.php")
 	if err != nil {
 		return "", err
@@ -1572,6 +1623,10 @@ func getPublicIPv4() (string, error) {
 
 // getIPv6Public fetches the public IPv6 address.
 func getIPv6Public() (string, error) {
+	return publicIPv6Cache.get(fetchPublicIPv6)
+}
+
+func fetchPublicIPv6() (string, error) {
 	resp, err := secureHTTPClient.Get("https://6.photonicat.com/ip.php")
 	if err != nil {
 		return "", err
@@ -1768,14 +1823,25 @@ func getDHCPClients() ([]string, error) {
 }
 
 // getWifiClients returns WiFi client MAC addresses for OpenWRT.
-func getWifiClients() (string, error) {
-	// Try OpenWRT method first
-	if clients, err := getOpenWrtWifiClients(); err == nil {
-		return clients, nil
-	}
+// WiFi client enumeration shells out to `iwinfo <iface> assoclist` for up to 6
+// candidate interfaces every call — the single biggest source of forks in the
+// 4s network cycle. The associated-client set changes slowly, so cache it.
+var wifiClientsCache = newStringCache(30 * time.Second)
 
-	// Fallback for Debian/other systems
-	return getDebianWifiClients()
+func getWifiClients() (string, error) {
+	return wifiClientsCache.get(func() (string, error) {
+		// Try OpenWRT method first.
+		if clients, err := getOpenWrtWifiClients(); err == nil {
+			return clients, nil
+		} else if isOpenWRT() {
+			// On OpenWrt a "no clients" error is the normal empty case — cache
+			// the empty result so we don't re-fork iwinfo every cycle while no
+			// device is connected.
+			return "", nil
+		}
+		// Fallback for Debian/other systems.
+		return getDebianWifiClients()
+	})
 }
 
 // getOpenWrtDHCPClients reads DHCP clients from OpenWRT lease file
