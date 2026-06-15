@@ -104,3 +104,51 @@ func TestStringCache(t *testing.T) {
 }
 
 var errTest = fmt.Errorf("boom")
+
+func TestOnActiveEgressUpdate(t *testing.T) {
+	// Reset package state the function mutates.
+	lastEgressMu.Lock()
+	lastEgress, lastEgressSeen = "", false
+	lastEgressMu.Unlock()
+
+	// Seed a fresh value into the cache, then confirm invalidation drops it.
+	seed := func() {
+		publicIPv4Cache = newStringCache(time.Hour)
+		publicIPv6Cache = newStringCache(time.Hour)
+		_, _ = publicIPv4Cache.get(func() (string, error) { return "1.2.3.4", nil })
+		_, _ = publicIPv6Cache.get(func() (string, error) { return "::1", nil })
+	}
+	isValid := func(c *stringCache) bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.valid
+	}
+
+	// First observation: must NOT invalidate (cold start, nothing to compare).
+	seed()
+	onActiveEgressUpdate("eth")
+	if !isValid(publicIPv4Cache) || !isValid(publicIPv6Cache) {
+		t.Fatal("first egress observation should not invalidate")
+	}
+
+	// Same value again: no invalidation.
+	seed()
+	onActiveEgressUpdate("eth")
+	if !isValid(publicIPv4Cache) {
+		t.Fatal("unchanged egress should not invalidate")
+	}
+
+	// Changed value: must invalidate both caches.
+	seed()
+	onActiveEgressUpdate("5g")
+	if isValid(publicIPv4Cache) || isValid(publicIPv6Cache) {
+		t.Fatal("egress change must invalidate both public IP caches")
+	}
+
+	// Empty value: ignored (no signal), no invalidation.
+	seed()
+	onActiveEgressUpdate("")
+	if !isValid(publicIPv4Cache) {
+		t.Fatal("empty egress should be ignored")
+	}
+}

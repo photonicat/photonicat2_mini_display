@@ -110,6 +110,15 @@ func (c *stringCache) get(fetch func() (string, error)) (string, error) {
 	return v, nil
 }
 
+// Invalidate drops the cached value so the next get() refetches immediately.
+// Used when an external event (e.g. a WAN/egress switch) makes the cached value
+// stale before its TTL would expire.
+func (c *stringCache) Invalidate() {
+	c.mu.Lock()
+	c.valid = false
+	c.mu.Unlock()
+}
+
 func getUserAgent() string {
 	return "photonicat2_display/r7700"
 }
@@ -310,6 +319,11 @@ func getInfoFromPcatWeb() {
 				globalData.Store("BoardTemperature", info.BoardTemperature)
 				globalData.Store("Carrier", info.Carrier)
 				globalData.Store("GatewayDevice", info.Connection)
+				// A change in the active egress interface (e.g. 5G -> eth ->
+				// wifi) means our public IP almost certainly changed. Drop the
+				// long-lived public-IP caches so the next network cycle re-checks
+				// immediately instead of showing a stale IP for up to the TTL.
+				onActiveEgressUpdate(info.ActiveEgress)
 				globalData.Store("ActiveEgress", info.ActiveEgress)
 				globalData.Store("NetworkMode", info.NetworkMode)
 				if info.WifiSignalPercent != nil {
@@ -1593,6 +1607,34 @@ var (
 	publicIPv4Cache = newStringCache(60 * time.Minute)
 	publicIPv6Cache = newStringCache(60 * time.Minute)
 )
+
+// Tracks the last observed active egress interface to detect WAN switches.
+var (
+	lastEgressMu   sync.Mutex
+	lastEgress     string
+	lastEgressSeen bool
+)
+
+// onActiveEgressUpdate is called with the freshly polled active egress interface.
+// When it changes (a WAN switch such as 5G -> eth -> wifi), the public IP has
+// almost certainly changed too, so we invalidate the public-IP caches; the next
+// network-collection cycle (within a few seconds) then re-fetches the real IP.
+func onActiveEgressUpdate(egress string) {
+	if egress == "" {
+		return // no signal yet; don't churn the cache
+	}
+	lastEgressMu.Lock()
+	changed := lastEgressSeen && egress != lastEgress
+	lastEgress = egress
+	lastEgressSeen = true
+	lastEgressMu.Unlock()
+
+	if changed {
+		log.Printf("Active egress changed to %q — invalidating public IP cache", egress)
+		publicIPv4Cache.Invalidate()
+		publicIPv6Cache.Invalidate()
+	}
+}
 
 func getPublicIPv4() (string, error) {
 	return publicIPv4Cache.get(fetchPublicIPv4)
