@@ -55,6 +55,21 @@ var localHTTPClient = &http.Client{
 	Transport: &uaTransport{},
 }
 
+// Pre-compiled regexes. These used to be compiled on every call inside hot,
+// per-cycle functions (sanitizeCommandArg runs on EVERY secureExecCommand);
+// compiling once at startup avoids that repeated cost on the slow ARM core.
+var (
+	reValidArg = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
+	reStaMode  = regexp.MustCompile(`^wireless\.([^.]+)\.mode='?sta'?$`)
+	reESSID    = regexp.MustCompile(`ESSID:"(.*?)"`)
+)
+
+// isOpenWRT result is fixed for the life of the process; compute it once.
+var (
+	openWrtOnce sync.Once
+	openWrtVal  bool
+)
+
 func getUserAgent() string {
 	return "photonicat2_display/r7700"
 }
@@ -62,8 +77,7 @@ func getUserAgent() string {
 // sanitizeCommandArg validates and sanitizes command arguments
 func sanitizeCommandArg(arg string) string {
 	// Remove any shell metacharacters and limit to alphanumeric, dash, underscore, dot, slash
-	validPattern := regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
-	if !validPattern.MatchString(arg) {
+	if !reValidArg.MatchString(arg) {
 		return ""
 	}
 	return arg
@@ -911,40 +925,108 @@ func getInterfaceBytes(iface string) (rxBytes, txBytes uint64, err error) {
 }
 
 func isOpenWRT() bool {
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		return true
+	openWrtOnce.Do(func() {
+		_, err := os.Stat("/etc/openwrt_release")
+		openWrtVal = err == nil
+	})
+	return openWrtVal
+}
+
+// wirelessConfig holds the SSIDs parsed from a single `uci show wireless` dump.
+// SSIDs change very rarely, but collectNetworkData used to shell out to uci 2-3
+// times every cycle (4s) to read them. We now parse one dump and cache it, so
+// the common case costs zero forks. staSSID is the upstream hotspot SSID in
+// Smart WAN (station) mode; ssid0/ssid1 are wifi-iface[0]/[1].
+type wirelessConfig struct {
+	staSSID string
+	ssid0   string
+	ssid1   string
+}
+
+var (
+	wirelessCacheMu  sync.Mutex
+	wirelessCacheVal wirelessConfig
+	wirelessCacheAt  time.Time
+	wirelessCacheOK  bool
+	// SSIDs essentially never change at runtime; refresh at most this often.
+	wirelessCacheTTL = 30 * time.Second
+)
+
+// getWirelessConfig returns the cached wireless config, refreshing it from a
+// single `uci show wireless` call when the cache is empty or older than the TTL.
+func getWirelessConfig() (wirelessConfig, bool) {
+	wirelessCacheMu.Lock()
+	defer wirelessCacheMu.Unlock()
+
+	if wirelessCacheOK && time.Since(wirelessCacheAt) < wirelessCacheTTL {
+		return wirelessCacheVal, true
 	}
-	return false
+
+	out, err := secureExecCommand("uci", "-q", "show", "wireless")
+	if err != nil {
+		// Keep serving the last good value if we have one.
+		return wirelessCacheVal, wirelessCacheOK
+	}
+
+	cfg := parseWirelessShow(string(out))
+	wirelessCacheVal = cfg
+	wirelessCacheAt = time.Now()
+	wirelessCacheOK = true
+	return cfg, true
+}
+
+// parseWirelessShow extracts the STA-mode SSID and the SSIDs of wifi-iface[0]
+// and wifi-iface[1] from `uci show wireless` output. Split out for testability.
+// Lines look like:
+//	wireless.cfg0a2b63.mode='sta'
+//	wireless.cfg0a2b63.ssid='Shanghai Novotech WiFi7_5G'
+//	wireless.default_radio0.ssid='photonicat2'
+func parseWirelessShow(out string) wirelessConfig {
+	var cfg wirelessConfig
+	staSection := ""
+	// section name -> ssid, plus ordered list of wifi-iface section names
+	ssidBySection := map[string]string{}
+	var ifaceSections []string
+
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if m := reStaMode.FindStringSubmatch(line); m != nil {
+			staSection = m[1]
+			continue
+		}
+		// wireless.<section>.ssid='...'
+		if i := strings.Index(line, ".ssid="); i > len("wireless.") && strings.HasPrefix(line, "wireless.") {
+			section := line[len("wireless.") : i]
+			val := strings.TrimSpace(line[i+len(".ssid="):])
+			val = strings.Trim(val, "'\"")
+			ssidBySection[section] = val
+			ifaceSections = append(ifaceSections, section)
+		}
+	}
+
+	if staSection != "" {
+		cfg.staSSID = ssidBySection[staSection]
+	}
+	// Preserve previous behaviour: wifi-iface[0]/[1] map to the 1st/2nd
+	// sections that carry an ssid, in uci output order.
+	if len(ifaceSections) > 0 {
+		cfg.ssid0 = ssidBySection[ifaceSections[0]]
+	}
+	if len(ifaceSections) > 1 {
+		cfg.ssid1 = ssidBySection[ifaceSections[1]]
+	}
+	return cfg
 }
 
 // getOpenWrtStaSSID returns the SSID of the first wifi-iface in station (sta)
 // mode — i.e. the upstream hotspot we are connected to in Smart WAN mode. Empty
-// string when no STA iface is configured. Matches lines like:
-//	wireless.cfg0a2b63.mode='sta'
-//	wireless.cfg0a2b63.ssid='Shanghai Novotech WiFi7_5G'
+// string when no STA iface is configured.
 func getOpenWrtStaSSID() string {
-	out, err := secureExecCommand("uci", "-q", "show", "wireless")
-	if err != nil {
+	cfg, ok := getWirelessConfig()
+	if !ok {
 		return ""
 	}
-	staSection := ""
-	reMode := regexp.MustCompile(`^wireless\.([^.]+)\.mode='?sta'?$`)
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if m := reMode.FindStringSubmatch(line); m != nil {
-			staSection = m[1]
-			break
-		}
-	}
-	if staSection == "" {
-		return ""
-	}
-	ssidOut, err := secureExecCommand("uci", "-q", "get",
-		"wireless."+staSection+".ssid")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(ssidOut))
+	return cfg.staSSID
 }
 
 // getSSID returns connected SSID on Debian or broadcasting SSID on OpenWrt.
@@ -957,11 +1039,10 @@ func getSSID() (string, error) {
 		if sta := getOpenWrtStaSSID(); sta != "" {
 			return sta, nil
 		}
-		out, err := secureExecCommand("uci", "get", "wireless.@wifi-iface[0].ssid")
-		if err != nil {
-			return "", fmt.Errorf("failed to get OpenWrt SSID: %v", err)
+		if cfg, ok := getWirelessConfig(); ok {
+			return cfg.ssid0, nil
 		}
-		return strings.TrimSpace(string(out)), nil
+		return "", fmt.Errorf("failed to get OpenWrt SSID")
 	}
 
 	// Debian/Ubuntu: Try iwgetid first
@@ -974,8 +1055,7 @@ func getSSID() (string, error) {
 
 	// Fallback 1: iwconfig
 	if out, err := secureExecCommand("iwconfig"); err == nil {
-		re := regexp.MustCompile(`ESSID:"(.*?)"`)
-		matches := re.FindSubmatch(out)
+		matches := reESSID.FindSubmatch(out)
 		if len(matches) >= 2 {
 			ssid := string(matches[1])
 			if ssid != "" && ssid != "off/any" {
@@ -1001,13 +1081,12 @@ func getSSID() (string, error) {
 // getSSID returns connected SSID on Debian or broadcasting SSID on OpenWrt.
 func getSSID2() (string, error) {
 	// OpenWrt detection
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		// OpenWrt: Use uci command
-		out, err := secureExecCommand("uci", "get", "wireless.@wifi-iface[1].ssid")
-		if err != nil {
-			return "", fmt.Errorf("failed to get OpenWrt SSID: %v", err)
+	if isOpenWRT() {
+		// OpenWrt: serve the second wifi-iface SSID from the shared cache.
+		if cfg, ok := getWirelessConfig(); ok {
+			return cfg.ssid1, nil
 		}
-		return strings.TrimSpace(string(out)), nil
+		return "", fmt.Errorf("failed to get OpenWrt SSID")
 	}
 
 	// Debian/Ubuntu: Try iwgetid first
@@ -1020,8 +1099,7 @@ func getSSID2() (string, error) {
 
 	// Fallback 1: iwconfig
 	if out, err := secureExecCommand("iwconfig"); err == nil {
-		re := regexp.MustCompile(`ESSID:"(.*?)"`)
-		matches := re.FindSubmatch(out)
+		matches := reESSID.FindSubmatch(out)
 		if len(matches) >= 2 {
 			ssid := string(matches[1])
 			if ssid != "" && ssid != "off/any" {
